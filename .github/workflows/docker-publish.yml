@@ -12,8 +12,8 @@ on:
       - "**.md"
 
 env:
-  DOCKER_HUB_ORG: firstset
-  DOCKER_HUB_REPO: tenderduty
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -31,21 +31,35 @@ jobs:
       - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # short sha on every push
+            type=sha,format=short
+            # 'latest' only on pushes to the default branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            # full semver on release  (e.g. v2.3.7)
+            type=semver,pattern={{version}}
+            # major.minor on release  (e.g. 2.3)
+            type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v4
+        uses: docker/build-push-action@v5
         with:
           platforms: linux/amd64,linux/arm64
           push: true
           context: .
-          tags: |
-            ${{ env.DOCKER_HUB_ORG }}/${{ env.DOCKER_HUB_REPO }}:latest
-            ${{ env.DOCKER_HUB_ORG }}/${{ env.DOCKER_HUB_REPO }}:${{ github.sha }}
-            ${{ github.event.release.tag_name != '' && format('{0}/{1}:{2}', env.DOCKER_HUB_ORG, env.DOCKER_HUB_REPO, github.event.release.tag_name) || '' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

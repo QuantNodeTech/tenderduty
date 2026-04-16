@@ -135,40 +135,46 @@ func (d *DefaultProvider) QueryUnvotedOpenProposals(ctx context.Context) ([]gov.
 		ProposalStatus: gov.StatusVotingPeriod,
 	}
 	b, err := qProposal.Marshal()
-	if err == nil {
-		resp, err := d.ChainConfig.client.ABCIQuery(ctx, "/cosmos.gov.v1.Query/Proposals", b)
-		if resp == nil || resp.Response.Value == nil {
-			return nil, fmt.Errorf("🛑 failed to query proposals for %s, error: %v", d.ChainConfig.name, err)
-		} else {
-			proposals := &gov.QueryProposalsResponse{}
-			err = proposals.Unmarshal(resp.Response.Value)
-			if err == nil {
-				// Step 2: Filter out proposals the validator has already voted on
-				var unvotedProposals []gov.Proposal
+	if err != nil {
+		return nil, fmt.Errorf("marshal proposals request for %s: %w", d.ChainConfig.name, err)
+	}
 
-				for _, proposal := range proposals.Proposals {
-					// For each proposal, check if the validator has voted
-					accAddress, err := ConvertValopertToAccAddress(d.ChainConfig.ValAddress)
-					if err != nil {
-						l(slog.LevelWarn, fmt.Sprintf("⚠️ Cannot convert valoper to account address: %v", err))
-						continue
-					}
+	resp, err := d.ChainConfig.client.ABCIQuery(ctx, "/cosmos.gov.v1.Query/Proposals", b)
+	if err != nil {
+		return nil, fmt.Errorf("🛑 query proposals for %s: %w", d.ChainConfig.name, err)
+	}
+	if resp == nil || resp.Response.Value == nil {
+		return nil, fmt.Errorf("🛑 empty proposals response for %s (code=%d log=%s)", d.ChainConfig.name, resp.Response.Code, resp.Response.Log)
+	}
+	if resp.Response.Code != 0 {
+		return nil, fmt.Errorf("🛑 proposals query returned non-zero code for %s: code=%d log=%s", d.ChainConfig.name, resp.Response.Code, resp.Response.Log)
+	}
 
-					hasVoted, err := d.CheckIfValidatorVoted(ctx, proposal.ProposalId, accAddress)
-					if err != nil {
-						l(slog.LevelWarn, fmt.Sprintf("⚠️ Error checking if validator voted: %v", err))
-					}
+	proposals := &gov.QueryProposalsResponse{}
+	if err = proposals.Unmarshal(resp.Response.Value); err != nil {
+		return nil, fmt.Errorf("🛑 unmarshal proposals for %s: %w", d.ChainConfig.name, err)
+	}
 
-					if !hasVoted {
-						unvotedProposals = append(unvotedProposals, proposal)
-					}
-				}
+	// Filter out proposals the validator has already voted on
+	var unvotedProposals []gov.Proposal
+	for _, proposal := range proposals.Proposals {
+		accAddress, err := ConvertValopertToAccAddress(d.ChainConfig.ValAddress)
+		if err != nil {
+			l(slog.LevelWarn, fmt.Sprintf("⚠️ Cannot convert valoper to account address: %v", err))
+			continue
+		}
 
-				return unvotedProposals, nil
-			}
+		hasVoted, err := d.CheckIfValidatorVoted(ctx, proposal.ProposalId, accAddress)
+		if err != nil {
+			l(slog.LevelWarn, fmt.Sprintf("⚠️ Error checking if validator voted: %v", err))
+		}
+
+		if !hasVoted {
+			unvotedProposals = append(unvotedProposals, proposal)
 		}
 	}
-	return nil, err
+
+	return unvotedProposals, nil
 }
 
 func (d *DefaultProvider) QueryDenomMetadata(ctx context.Context, denom string) (medatada *bank.Metadata, err error) {

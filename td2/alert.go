@@ -1083,16 +1083,17 @@ func evaluateUnvotedGovernanceProposalAlert(cc *ChainConfig) (bool, bool) {
 		}
 		alertMsg := fmt.Sprintf(msgTemplate, proposal.ProposalId, cc.name, deadline)
 
-		if !alarms.exist(cc.name, alertID) {
-			td.alert(
-				cc.name,
-				alertMsg,
-				"warning",
-				false,
-				&alertID,
-			)
-			alert = true
-		}
+		// Always call td.alert() so shouldNotify() can apply the reminder interval logic.
+		// shouldNotify() suppresses duplicate notifications and handles the reminder re-send
+		// timing (governed by governance_alerts_reminder_interval).
+		td.alert(
+			cc.name,
+			alertMsg,
+			"warning",
+			false,
+			&alertID,
+		)
+		alert = true
 	}
 
 	messagesToBeResolved := make(map[uint64]string)
