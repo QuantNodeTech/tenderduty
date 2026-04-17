@@ -1064,6 +1064,11 @@ func evaluateUnclaimedRewardsAlert(cc *ChainConfig) (bool, bool) {
 	return alert, resolved
 }
 
+// minGovAlarmAge is how long a governance alarm must have existed before it can
+// be resolved. Guards against transient RPC failures that return an empty
+// proposal list, which would otherwise immediately clear a fresh alarm.
+const minGovAlarmAge = 5 * time.Minute
+
 func evaluateUnvotedGovernanceProposalAlert(cc *ChainConfig) (bool, bool) {
 	alert, resolved := false, false
 
@@ -1075,6 +1080,11 @@ func evaluateUnvotedGovernanceProposalAlert(cc *ChainConfig) (bool, bool) {
 		unvotedProposalMap[proposal.ProposalId] = true
 	}
 
+	// Alert on first detection; re-alert only when the reminder interval has elapsed.
+	// We check AllAlarms.SentTime here so we only put a message on alertChan when
+	// needed — avoiding channel pressure from every 2-second watch() iterations.
+	// shouldNotify() then performs the final per-destination deduplication check
+	// using SentTgAlarms / SentPdAlarms etc.
 	for _, proposal := range cc.unvotedOpenGovProposals {
 		alertID := fmt.Sprintf(idTemplate, cc.ValAddress, proposal.ProposalId)
 		deadline := fmt.Sprintf(", deadline: %s UTC", proposal.VotingEndTime.Format("2006-01-02 15:04"))
@@ -1083,48 +1093,65 @@ func evaluateUnvotedGovernanceProposalAlert(cc *ChainConfig) (bool, bool) {
 		}
 		alertMsg := fmt.Sprintf(msgTemplate, proposal.ProposalId, cc.name, deadline)
 
-		// Always call td.alert() so shouldNotify() can apply the reminder interval logic.
-		// shouldNotify() suppresses duplicate notifications and handles the reminder re-send
-		// timing (governed by governance_alerts_reminder_interval).
-		td.alert(
-			cc.name,
-			alertMsg,
-			"warning",
-			false,
-			&alertID,
-		)
-		alert = true
-	}
-
-	messagesToBeResolved := make(map[uint64]string)
-
-	alarms.notifyMux.RLock()
-
-	if alarms.AllAlarms[cc.name] != nil {
-		for alertID := range alarms.AllAlarms[cc.name] {
-			if strings.HasPrefix(alertID, "UnvotedGovernanceProposal") {
-				parts := strings.Split(alertID, "_")
-				if proposalID, err := strconv.ParseUint(parts[len(parts)-1], 10, 64); err == nil {
-					if !unvotedProposalMap[proposalID] {
-						messagesToBeResolved[proposalID] = alertID
-					}
-				}
+		shouldSend := false
+		if !alarms.exist(cc.name, alertID) {
+			shouldSend = true // first detection
+		} else {
+			alarms.notifyMux.RLock()
+			lastSent := alarms.AllAlarms[cc.name][alertID].SentTime
+			alarms.notifyMux.RUnlock()
+			if time.Since(lastSent) >= time.Duration(td.GovernanceAlertsReminderInterval)*time.Hour {
+				shouldSend = true // reminder interval elapsed
 			}
+		}
+
+		if shouldSend {
+			td.alert(cc.name, alertMsg, "warning", false, &alertID)
+			alert = true
 		}
 	}
 
+	// Collect governance alarms that are no longer in the unvoted list.
+	// Read message and SentTime inside the lock to avoid a race with td.alert().
+	type pendingResolve struct {
+		alertID string
+		message string
+		sentAt  time.Time
+	}
+	var toResolve []pendingResolve
+
+	alarms.notifyMux.RLock()
+	if alarms.AllAlarms[cc.name] != nil {
+		for alertID, cache := range alarms.AllAlarms[cc.name] {
+			if !strings.HasPrefix(alertID, "UnvotedGovernanceProposal") {
+				continue
+			}
+			parts := strings.Split(alertID, "_")
+			proposalID, err := strconv.ParseUint(parts[len(parts)-1], 10, 64)
+			if err != nil {
+				continue
+			}
+			if unvotedProposalMap[proposalID] {
+				continue // proposal still unvoted, do not resolve
+			}
+			toResolve = append(toResolve, pendingResolve{
+				alertID: alertID,
+				message: cache.Message,
+				sentAt:  cache.SentTime,
+			})
+		}
+	}
 	alarms.notifyMux.RUnlock()
 
-	for _, alertID := range messagesToBeResolved {
-		if alarms.exist(cc.name, alertID) {
-			alertIDCopy := alertID // Create local copy to avoid implicit memory aliasing
-			td.alert(
-				cc.name,
-				alarms.AllAlarms[cc.name][alertID].Message,
-				"warning",
-				true,
-				&alertIDCopy,
-			)
+	for _, item := range toResolve {
+		// Require the alarm to have existed for minGovAlarmAge before resolving.
+		// A single transient empty-proposals response should not wipe out a live alarm.
+		if time.Since(item.sentAt) < minGovAlarmAge {
+			continue
+		}
+		if alarms.exist(cc.name, item.alertID) {
+			alertIDCopy := item.alertID
+			td.alert(cc.name, item.message, "warning", true, &alertIDCopy)
 			resolved = true
 		}
 	}
