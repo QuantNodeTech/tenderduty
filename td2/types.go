@@ -158,6 +158,19 @@ type Config struct {
 
 // savedState is dumped to a JSON file at exit time, and is loaded at start. If successful it will prevent
 // duplicate alerts, and will show old blocks in the dashboard.
+type govVoteStatus int
+
+const (
+	govVoteUnknown   govVoteStatus = iota // not yet confirmed either way
+	govVoteConfirmed                      // hash-verified vote found — skip all future checks
+	govVoteNotVoted                       // indexer confirmed working + 15 min elapsed with no vote found
+)
+
+type govVoteState struct {
+	status    govVoteStatus
+	firstSeen time.Time
+}
+
 type savedState struct {
 	Alarms    *alarmCache                     `json:"alarms"`
 	Blocks    map[string][]int                `json:"blocks"`
@@ -195,7 +208,8 @@ type ChainConfig struct {
 	lastBlockAlarm          bool
 	lastBlockNum            int64
 	activeAlerts            int
-	unvotedOpenGovProposals []gov.Proposal // the open proposals that the validator has not voted on
+	unvotedOpenGovProposals []gov.Proposal           // the open proposals that the validator has not voted on
+	govVoteCache            map[uint64]*govVoteState // per-proposal vote confirmation state
 
 	statTotalSigns       float64
 	statTotalProps       float64

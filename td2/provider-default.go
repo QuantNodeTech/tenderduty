@@ -52,77 +52,110 @@ type DefaultProvider struct {
 	ChainConfig *ChainConfig
 }
 
-func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID uint64, accAddress string) (bool, error) {
+// txSearchFirstHash queries tx_search on nodeURL and returns the hash of the first result,
+// or "" if none found. query is the raw query string (already quoted).
+func txSearchFirstHash(ctx context.Context, client *http.Client, nodeURL, query string) (hash string, err error) {
 	params := url.Values{}
-	query := fmt.Sprintf("\"proposal_vote.proposal_id='%d' AND proposal_vote.voter='%s'\"", proposalID, accAddress)
 	params.Add("query", query)
 	params.Add("prove", "false")
 	params.Add("page", "1")
 	params.Add("per_page", "1")
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/tx_search?%s", nodeURL, params.Encode()), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req) //#nosec G704 -- URL is from operator-supplied config
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var result map[string]any
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if resultObj, ok := result["result"].(map[string]any); ok {
+		if txs, ok := resultObj["txs"].([]any); ok && len(txs) > 0 {
+			if tx, ok := txs[0].(map[string]any); ok {
+				if h, ok := tx["hash"].(string); ok {
+					return h, nil
+				}
+			}
+		}
+	}
+	return "", nil
+}
 
-	// Create a reusable HTTP client with timeout
+// verifyTxHash confirms a transaction exists on nodeURL by querying /tx?hash=.
+func verifyTxHash(ctx context.Context, client *http.Client, nodeURL, hash string) bool {
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/tx?hash=0x%s", nodeURL, hash), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req) //#nosec G704 -- URL is from operator-supplied config
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var result map[string]any
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false
+	}
+	_, hasResult := result["result"]
+	return hasResult
+}
+
+func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID uint64, accAddress string) (bool, error) {
+	cc := d.ChainConfig
+
+	// Init cache on first use
+	if cc.govVoteCache == nil {
+		cc.govVoteCache = make(map[uint64]*govVoteState)
+	}
+
+	state, exists := cc.govVoteCache[proposalID]
+	if !exists {
+		state = &govVoteState{status: govVoteUnknown, firstSeen: time.Now()}
+		cc.govVoteCache[proposalID] = state
+	}
+
+	// Hash-verified vote — trust it forever, no further queries needed
+	if state.status == govVoteConfirmed {
+		return true, nil
+	}
+
 	tr := &http.Transport{
 		//#nosec G402 -- configurable option
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: td.TLSSkipVerify},
 	}
-	client := &http.Client{
-		Transport: tr,
-		Timeout:   5 * time.Second, // Add reasonable timeout
-	}
+	httpClient := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 
-	// Store the last error to return if all nodes fail
-	var lastErr error
+	voterQuery := fmt.Sprintf("\"proposal_vote.proposal_id='%d' AND proposal_vote.voter='%s'\"", proposalID, accAddress)
+	anyVoteQuery := fmt.Sprintf("\"proposal_vote.proposal_id='%d'\"", proposalID)
 
-	// Try each node in the list until we find a vote or exhaust all options
-	for _, node := range d.ChainConfig.Nodes {
-		reqURL := fmt.Sprintf("%s/tx_search?%s", node.Url, params.Encode())
-
-		// Make the HTTP request with context
-		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	for _, node := range cc.Nodes {
+		hash, err := txSearchFirstHash(ctx, httpClient, node.Url, voterQuery)
 		if err != nil {
-			lastErr = err
-			continue // Try next node
+			continue
+		}
+		if hash != "" {
+			// Found a candidate tx — verify it by hash before trusting
+			if verifyTxHash(ctx, httpClient, node.Url, hash) {
+				state.status = govVoteConfirmed
+				return true, nil
+			}
+			// Hash check failed on this node — try the next one
+			continue
 		}
 
-		resp, err := client.Do(req) //#nosec G704 -- URL is from operator-supplied config
+		// No vote tx found on this node — check if the indexer has ANY votes for this proposal
+		anyHash, err := txSearchFirstHash(ctx, httpClient, node.Url, anyVoteQuery)
 		if err != nil {
-			lastErr = err
-			continue // Try next node
+			continue
 		}
-
-		// Use defer in a function to ensure it's called before continuing the loop
-		found := false
-		func() {
-			defer resp.Body.Close()
-
-			// check for existence of txs
-			var result map[string]any
-			if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-				lastErr = err
-				return // Exit this func, continue loop
-			}
-
-			// Navigate the JSON structure to check if txs exist
-			if resultObj, ok := result["result"].(map[string]any); ok {
-				if txs, ok := resultObj["txs"].([]any); ok && len(txs) > 0 {
-					// Set found to true so we return true outside the loop
-					found = true
-				}
-			}
-		}()
-
-		// If we found a vote with this node, return immediately
-		if found {
-			return true, nil
+		if anyHash != "" && time.Since(state.firstSeen) >= 15*time.Minute {
+			// Indexer is working and proposal has been active for 15+ min with no vote from us
+			state.status = govVoteNotVoted
 		}
-
-		// Otherwise, continue to next node
-	}
-
-	// If we've tried all nodes and found no votes, return false
-	// If there were errors, return the last one
-	if lastErr != nil {
-		return false, fmt.Errorf("did not find validator vote transaction across all nodes, last error in a response: %w", lastErr)
 	}
 
 	return false, nil
@@ -155,21 +188,34 @@ func (d *DefaultProvider) QueryUnvotedOpenProposals(ctx context.Context) ([]gov.
 		return nil, fmt.Errorf("🛑 unmarshal proposals for %s: %w", d.ChainConfig.name, err)
 	}
 
-	// Filter out proposals the validator has already voted on
+	accAddress, err := ConvertValopertToAccAddress(d.ChainConfig.ValAddress)
+	if err != nil {
+		return nil, fmt.Errorf("🛑 cannot convert valoper to account address for %s: %w", d.ChainConfig.name, err)
+	}
+
+	// Build set of active proposal IDs for cache cleanup
+	activeIDs := make(map[uint64]bool, len(proposals.Proposals))
+	for _, p := range proposals.Proposals {
+		activeIDs[p.ProposalId] = true
+	}
+	for id := range d.ChainConfig.govVoteCache {
+		if !activeIDs[id] {
+			delete(d.ChainConfig.govVoteCache, id)
+		}
+	}
+
+	// Update vote state for each active proposal, then include only confirmed-unvoted ones
 	var unvotedProposals []gov.Proposal
 	for _, proposal := range proposals.Proposals {
-		accAddress, err := ConvertValopertToAccAddress(d.ChainConfig.ValAddress)
-		if err != nil {
-			l(slog.LevelWarn, fmt.Sprintf("⚠️ Cannot convert valoper to account address: %v", err))
-			continue
-		}
-
 		hasVoted, err := d.CheckIfValidatorVoted(ctx, proposal.ProposalId, accAddress)
 		if err != nil {
 			l(slog.LevelWarn, fmt.Sprintf("⚠️ Error checking if validator voted: %v", err))
 		}
-
-		if !hasVoted {
+		if hasVoted {
+			continue
+		}
+		state := d.ChainConfig.govVoteCache[proposal.ProposalId]
+		if state != nil && state.status == govVoteNotVoted {
 			unvotedProposals = append(unvotedProposals, proposal)
 		}
 	}

@@ -1064,11 +1064,6 @@ func evaluateUnclaimedRewardsAlert(cc *ChainConfig) (bool, bool) {
 	return alert, resolved
 }
 
-// minGovAlarmAge is how long a governance alarm must have existed before it can
-// be resolved. Guards against transient RPC failures that return an empty
-// proposal list, which would otherwise immediately clear a fresh alarm.
-const minGovAlarmAge = 5 * time.Minute
-
 func evaluateUnvotedGovernanceProposalAlert(cc *ChainConfig) (bool, bool) {
 	alert, resolved := false, false
 
@@ -1112,11 +1107,10 @@ func evaluateUnvotedGovernanceProposalAlert(cc *ChainConfig) (bool, bool) {
 	}
 
 	// Collect governance alarms that are no longer in the unvoted list.
-	// Read message and SentTime inside the lock to avoid a race with td.alert().
+	// Read message inside the lock to avoid a race with td.alert().
 	type pendingResolve struct {
 		alertID string
 		message string
-		sentAt  time.Time
 	}
 	var toResolve []pendingResolve
 
@@ -1137,18 +1131,12 @@ func evaluateUnvotedGovernanceProposalAlert(cc *ChainConfig) (bool, bool) {
 			toResolve = append(toResolve, pendingResolve{
 				alertID: alertID,
 				message: cache.Message,
-				sentAt:  cache.SentTime,
 			})
 		}
 	}
 	alarms.notifyMux.RUnlock()
 
 	for _, item := range toResolve {
-		// Require the alarm to have existed for minGovAlarmAge before resolving.
-		// A single transient empty-proposals response should not wipe out a live alarm.
-		if time.Since(item.sentAt) < minGovAlarmAge {
-			continue
-		}
 		if alarms.exist(cc.name, item.alertID) {
 			alertIDCopy := item.alertID
 			td.alert(cc.name, item.message, "warning", true, &alertIDCopy)
