@@ -17,11 +17,15 @@ import (
 	rpchttp "github.com/tendermint/tendermint/rpc/client/http"
 )
 
-// newRpc sets up the rpc client used for monitoring. It will try nodes in order until a working node is found.
-// it will also get some initial info on the validator's status.
+// maxNodeStaleness is the maximum age of a node's latest block before it is
+// considered stale. A node that reports catching_up=false but hasn't produced
+// a block recently is treated the same as a lagging node.
+const maxNodeStaleness = 5 * time.Minute
+
+// newRpc sets up the rpc client used for monitoring. It probes all configured
+// nodes and picks the one with the highest (freshest) block height, preferring
+// nodes whose latest block is within maxNodeStaleness.
 func (cc *ChainConfig) newRpc() error {
-	// Try to load cosmos.directory data for this chain
-	// This is done early so we can use it for RPC fallback and chain params
 	if cc.cosmosDirectoryData == nil {
 		if err := cc.loadCosmosDirectoryData(); err != nil {
 			l(slog.LevelWarn, "ℹ️ cosmos.directory data not available for", cc.name, "(chain_name: "+cc.getEffectiveChainName()+", chain_id: "+cc.ChainId+")", "-", err)
@@ -32,84 +36,146 @@ func (cc *ChainConfig) newRpc() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	var anyWorking bool // if healthchecks are running, we will skip to the first known good node.
+
+	var anyWorking bool
 	for _, endpoint := range cc.Nodes {
 		anyWorking = anyWorking || !endpoint.down
 	}
 
-	// grab the first working endpoint
-	tryUrl := func(u string) (msg string, down, syncing bool) {
-		_, err := url.Parse(u)
-		if err != nil {
-			msg = fmt.Sprintf("❌ could not parse url %s: (%s) %s", cc.name, u, err)
-			l(slog.LevelInfo, msg)
-			down = true
-			return
-		}
-		cc.client, err = rpchttp.New(u, "/websocket")
-		if err != nil {
-			msg = fmt.Sprintf("❌ could not connect client for %s: (%s) %s", cc.name, u, err)
-			l(slog.LevelInfo, msg)
-			down = true
-			return
-		}
-		var network string
-		var catching_up bool
-		status, err := cc.client.Status(ctx)
-		if err != nil {
-			n, c, err := getStatusWithEndpoint(ctx, u)
-			if err != nil {
-				msg = fmt.Sprintf("❌ could not get status for %s: (%s) %s", cc.name, u, err)
-				down = true
-				l(slog.LevelInfo, msg)
-				return
-			}
-			network, catching_up = n, c
-		} else {
-			network, catching_up = status.NodeInfo.Network, status.SyncInfo.CatchingUp
-		}
-		if network != cc.ChainId {
-			msg = fmt.Sprintf("chain id %s on %s does not match, expected %s, skipping", network, u, cc.ChainId)
-			down = true
-			l(slog.LevelInfo, msg)
-			return
-		}
-		if catching_up {
-			msg = fmt.Sprint("🐢 node is not synced, skipping ", u)
-			syncing = true
-			down = true
-			l(slog.LevelInfo, msg)
-			return
-		}
-		cc.noNodes = false
-		return
-	}
-	down := func(endpoint *NodeConfig, msg string) {
+	markDown := func(endpoint *NodeConfig, msg string) {
 		if !endpoint.down {
 			endpoint.down = true
 			endpoint.downSince = time.Now()
 		}
 		endpoint.lastMsg = msg
 	}
+
+	type candidate struct {
+		client    *rpchttp.HTTP
+		height    int64
+		blockTime time.Time
+		endpoint  *NodeConfig
+		url       string
+	}
+
+	// probeUrl returns a candidate if the node is reachable, on the right chain,
+	// and not catching up. Returns nil + logs on any failure.
+	probeUrl := func(u string, endpoint *NodeConfig) *candidate {
+		if _, err := url.Parse(u); err != nil {
+			msg := fmt.Sprintf("❌ could not parse url %s: (%s) %s", cc.name, u, err)
+			l(slog.LevelInfo, msg)
+			if endpoint != nil {
+				markDown(endpoint, msg)
+			}
+			return nil
+		}
+		client, err := rpchttp.New(u, "/websocket")
+		if err != nil {
+			msg := fmt.Sprintf("❌ could not connect client for %s: (%s) %s", cc.name, u, err)
+			l(slog.LevelInfo, msg)
+			if endpoint != nil {
+				markDown(endpoint, msg)
+			}
+			return nil
+		}
+
+		var ns nodeStatus
+		status, err := client.Status(ctx)
+		if err != nil {
+			ns, err = getStatusWithEndpoint(ctx, u)
+			if err != nil {
+				msg := fmt.Sprintf("❌ could not get status for %s: (%s) %s", cc.name, u, err)
+				l(slog.LevelInfo, msg)
+				if endpoint != nil {
+					markDown(endpoint, msg)
+				}
+				return nil
+			}
+		} else {
+			ns = nodeStatus{
+				network:    status.NodeInfo.Network,
+				catchingUp: status.SyncInfo.CatchingUp,
+				height:     status.SyncInfo.LatestBlockHeight,
+				blockTime:  status.SyncInfo.LatestBlockTime,
+			}
+		}
+
+		if ns.network != cc.ChainId {
+			msg := fmt.Sprintf("chain id %s on %s does not match, expected %s, skipping", ns.network, u, cc.ChainId)
+			l(slog.LevelInfo, msg)
+			if endpoint != nil {
+				markDown(endpoint, msg)
+			}
+			return nil
+		}
+		if ns.catchingUp {
+			msg := fmt.Sprint("🐢 node is not synced, skipping ", u)
+			l(slog.LevelInfo, msg)
+			if endpoint != nil {
+				endpoint.syncing = true
+				markDown(endpoint, msg)
+			}
+			return nil
+		}
+		return &candidate{client: client, height: ns.height, blockTime: ns.blockTime, endpoint: endpoint, url: u}
+	}
+
+	var candidates []*candidate
 	for _, endpoint := range cc.Nodes {
 		if anyWorking && endpoint.down {
 			continue
 		}
-		if msg, failed, syncing := tryUrl(endpoint.Url); failed {
-			endpoint.syncing = syncing
-			down(endpoint, msg)
-			continue
+		if c := probeUrl(endpoint.Url, endpoint); c != nil {
+			candidates = append(candidates, c)
+		}
+	}
+
+	// Pick best candidate: prefer non-stale nodes, then highest block height.
+	pickBest := func(pool []*candidate) *candidate {
+		var best *candidate
+		for _, c := range pool {
+			if best == nil || c.height > best.height {
+				best = c
+			}
+		}
+		return best
+	}
+
+	now := time.Now()
+	var fresh []*candidate
+	for _, c := range candidates {
+		if !c.blockTime.IsZero() && now.Sub(c.blockTime) <= maxNodeStaleness {
+			fresh = append(fresh, c)
+		}
+	}
+
+	best := pickBest(fresh)
+	if best == nil {
+		best = pickBest(candidates)
+		if best != nil {
+			lag := now.Sub(best.blockTime).Round(time.Second)
+			l(slog.LevelWarn, fmt.Sprintf("⚠️ all nodes for %s are stale, using best available %s (lag %v)", cc.name, best.url, lag))
+		}
+	}
+
+	if best != nil {
+		cc.client = best.client
+		cc.noNodes = false
+		if len(candidates) > 1 {
+			l(slog.LevelInfo, fmt.Sprintf("✅ selected freshest node for %s: %s (height %d)", cc.name, best.url, best.height))
 		}
 		return nil
 	}
-	// Try cosmos.directory RPC proxy using chain_name (or lowercase display name)
-	// This is tried before the legacy PublicFallback to use the more reliable chain_name lookup
+
+	// No configured node worked — try cosmos.directory fallback
 	{
 		chainName := cc.getEffectiveChainName()
 		u := getRegistryUrlByChainName(chainName)
 		node := guessPublicEndpoint(u)
 		l(slog.LevelInfo, cc.ChainId, "⛑ attempting to use cosmos.directory fallback node (chain_name:", chainName+")", node)
-		if _, failed, _ := tryUrl(node); !failed {
+		if c := probeUrl(node, nil); c != nil {
+			cc.client = c.client
+			cc.noNodes = false
 			l(slog.LevelInfo, cc.ChainId, "⛑ connected to cosmos.directory endpoint", node)
 			return nil
 		}
@@ -121,7 +187,9 @@ func (cc *ChainConfig) newRpc() error {
 		if u, ok := getRegistryUrl(cc.ChainId); ok {
 			node := guessPublicEndpoint(u)
 			l(slog.LevelInfo, cc.ChainId, "⛑ attempting to use public fallback node (chain_id lookup)", node)
-			if _, failed, _ := tryUrl(node); !failed {
+			if c := probeUrl(node, nil); c != nil {
+				cc.client = c.client
+				cc.noNodes = false
 				l(slog.LevelInfo, cc.ChainId, "⛑ connected to public endpoint", node)
 				return nil
 			}
@@ -221,6 +289,11 @@ func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
 						node.syncing = true
 						return
 					}
+					if lag := time.Since(status.SyncInfo.LatestBlockTime); lag > maxNodeStaleness {
+						alert(fmt.Sprintf("stale (last block %v ago)", lag.Round(time.Second)))
+						node.syncing = true
+						return
+					}
 
 					// node's OK, clear the note
 					if node.down {
@@ -241,6 +314,19 @@ func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
 				if e != nil {
 					l(slog.LevelError, "💥", cc.ChainId, e)
 				}
+			} else {
+				// Re-select if the active client has become stale
+				sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if st, err := cc.client.Status(sctx); err == nil {
+					if time.Since(st.SyncInfo.LatestBlockTime) > maxNodeStaleness {
+						l(slog.LevelWarn, fmt.Sprintf("⚠️ active node for %s is stale (lag %v), reconnecting", cc.name, time.Since(st.SyncInfo.LatestBlockTime).Round(time.Second)))
+						cc.client = nil
+						if e := cc.newRpc(); e != nil {
+							l(slog.LevelError, "💥", cc.ChainId, e)
+						}
+					}
+				}
+				scancel()
 			}
 			if cc.valInfo != nil {
 				cc.lastValInfo = &ValInfo{
@@ -317,24 +403,25 @@ func guessPublicEndpoint(u string) string {
 	return proto + matches[1] + port
 }
 
-func getStatusWithEndpoint(ctx context.Context, u string) (string, bool, error) {
-	// Parse the URL
+type nodeStatus struct {
+	network    string
+	catchingUp bool
+	height     int64
+	blockTime  time.Time
+}
+
+func getStatusWithEndpoint(ctx context.Context, u string) (nodeStatus, error) {
 	parsedURL, err := url.Parse(u)
 	if err != nil {
-		return "", false, err
+		return nodeStatus{}, err
 	}
-
-	// Check if the scheme is 'tcp' and modify to 'http'
 	if parsedURL.Scheme == "tcp" {
 		parsedURL.Scheme = "http"
 	}
-
-	queryPath := fmt.Sprintf("%s/status", parsedURL.String())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, queryPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/status", parsedURL.String()), nil)
 	if err != nil {
-		return "", false, err
+		return nodeStatus{}, err
 	}
-
 	tr := &http.Transport{
 		//#nosec G402 -- configurable option
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: td.TLSSkipVerify},
@@ -342,30 +429,35 @@ func getStatusWithEndpoint(ctx context.Context, u string) (string, bool, error) 
 	client := &http.Client{Transport: tr}
 	resp, err := client.Do(req) //#nosec G704 -- URL is from operator-supplied config
 	if err != nil {
-		return "", false, err
+		return nodeStatus{}, err
 	}
 	defer resp.Body.Close()
-
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", false, err
+		return nodeStatus{}, err
 	}
-
 	type tendermintStatus struct {
-		JsonRPC string `json:"jsonrpc"`
-		ID      int    `json:"id"`
-		Result  struct {
+		Result struct {
 			NodeInfo struct {
 				Network string `json:"network"`
 			} `json:"node_info"`
 			SyncInfo struct {
-				CatchingUp bool `json:"catching_up"`
+				LatestBlockHeight string    `json:"latest_block_height"`
+				LatestBlockTime   time.Time `json:"latest_block_time"`
+				CatchingUp        bool      `json:"catching_up"`
 			} `json:"sync_info"`
 		} `json:"result"`
 	}
-	var status tendermintStatus
-	if err := json.Unmarshal(b, &status); err != nil {
-		return "", false, err
+	var s tendermintStatus
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nodeStatus{}, err
 	}
-	return status.Result.NodeInfo.Network, status.Result.SyncInfo.CatchingUp, nil
+	var height int64
+	fmt.Sscanf(s.Result.SyncInfo.LatestBlockHeight, "%d", &height)
+	return nodeStatus{
+		network:    s.Result.NodeInfo.Network,
+		catchingUp: s.Result.SyncInfo.CatchingUp,
+		height:     height,
+		blockTime:  s.Result.SyncInfo.LatestBlockTime,
+	}, nil
 }
