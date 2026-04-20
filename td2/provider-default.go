@@ -109,11 +109,16 @@ func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID 
 	}
 	httpClient := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 
+	// Use a fresh context so the shared GetValInfo deadline (10s, nearly consumed by
+	// earlier ABCI queries) does not cause these HTTP requests to fail silently.
+	reqCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	voterQuery := fmt.Sprintf("\"proposal_vote.proposal_id='%d' AND proposal_vote.voter='%s'\"", proposalID, accAddress)
 	anyVoteQuery := fmt.Sprintf("\"proposal_vote.proposal_id='%d'\"", proposalID)
 
 	for _, node := range cc.Nodes {
-		hash, err := txSearchFirstHash(ctx, httpClient, node.Url, voterQuery)
+		hash, err := txSearchFirstHash(reqCtx, httpClient, node.Url, voterQuery)
 		if err != nil {
 			continue
 		}
@@ -124,7 +129,7 @@ func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID 
 		}
 
 		// No vote tx on this node — check if the indexer has ANY votes for this proposal
-		anyHash, err := txSearchFirstHash(ctx, httpClient, node.Url, anyVoteQuery)
+		anyHash, err := txSearchFirstHash(reqCtx, httpClient, node.Url, anyVoteQuery)
 		if err != nil {
 			continue
 		}
