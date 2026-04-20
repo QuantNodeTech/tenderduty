@@ -115,7 +115,6 @@ func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID 
 	defer cancel()
 
 	voterQuery := fmt.Sprintf("\"proposal_vote.proposal_id='%d' AND proposal_vote.voter='%s'\"", proposalID, accAddress)
-	anyVoteQuery := fmt.Sprintf("\"proposal_vote.proposal_id='%d'\"", proposalID)
 
 	for _, node := range cc.Nodes {
 		hash, err := txSearchFirstHash(reqCtx, httpClient, node.Url, voterQuery)
@@ -128,13 +127,9 @@ func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID 
 			return true, nil
 		}
 
-		// No vote tx on this node — check if the indexer has ANY votes for this proposal
-		anyHash, err := txSearchFirstHash(reqCtx, httpClient, node.Url, anyVoteQuery)
-		if err != nil {
-			continue
-		}
-		if anyHash != "" && time.Since(state.firstSeen) >= 15*time.Minute {
-			// Indexer is working and proposal has been active 15+ min with no vote from us
+		// No vote tx on this node — after 15 min grace period mark as not-voted.
+		// Timer-only check so brand-new proposals with zero total votes are still caught.
+		if time.Since(state.firstSeen) >= 15*time.Minute {
 			state.status = govVoteNotVoted
 		}
 	}
