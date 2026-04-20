@@ -85,29 +85,9 @@ func txSearchFirstHash(ctx context.Context, client *http.Client, nodeURL, query 
 	return "", nil
 }
 
-// verifyTxHash confirms a transaction exists on nodeURL by querying /tx?hash=.
-func verifyTxHash(ctx context.Context, client *http.Client, nodeURL, hash string) bool {
-	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/tx?hash=0x%s", nodeURL, hash), nil)
-	if err != nil {
-		return false
-	}
-	resp, err := client.Do(req) //#nosec G704 -- URL is from operator-supplied config
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	var result map[string]any
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return false
-	}
-	_, hasResult := result["result"]
-	return hasResult
-}
-
 func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID uint64, accAddress string) (bool, error) {
 	cc := d.ChainConfig
 
-	// Init cache on first use
 	if cc.govVoteCache == nil {
 		cc.govVoteCache = make(map[uint64]*govVoteState)
 	}
@@ -118,7 +98,7 @@ func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID 
 		cc.govVoteCache[proposalID] = state
 	}
 
-	// Hash-verified vote — trust it forever, no further queries needed
+	// Once confirmed voted, skip all further queries
 	if state.status == govVoteConfirmed {
 		return true, nil
 	}
@@ -138,22 +118,18 @@ func (d *DefaultProvider) CheckIfValidatorVoted(ctx context.Context, proposalID 
 			continue
 		}
 		if hash != "" {
-			// Found a candidate tx — verify it by hash before trusting
-			if verifyTxHash(ctx, httpClient, node.Url, hash) {
-				state.status = govVoteConfirmed
-				return true, nil
-			}
-			// Hash check failed on this node — try the next one
-			continue
+			// Vote tx found for our validator — trust it
+			state.status = govVoteConfirmed
+			return true, nil
 		}
 
-		// No vote tx found on this node — check if the indexer has ANY votes for this proposal
+		// No vote tx on this node — check if the indexer has ANY votes for this proposal
 		anyHash, err := txSearchFirstHash(ctx, httpClient, node.Url, anyVoteQuery)
 		if err != nil {
 			continue
 		}
 		if anyHash != "" && time.Since(state.firstSeen) >= 15*time.Minute {
-			// Indexer is working and proposal has been active for 15+ min with no vote from us
+			// Indexer is working and proposal has been active 15+ min with no vote from us
 			state.status = govVoteNotVoted
 		}
 	}
