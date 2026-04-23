@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"strconv"
 
 	"github.com/cosmos/cosmos-sdk/crypto/keys/ed25519"
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
@@ -50,6 +51,24 @@ func ConvertValopertToAccAddress(valoperAddr string) (string, error) {
 
 type DefaultProvider struct {
 	ChainConfig *ChainConfig
+}
+
+// lcdGet performs a GET request against the LCD/REST endpoint and decodes JSON
+func (d *DefaultProvider) lcdGet(ctx context.Context, path string, result interface{}) error {
+    lcdUrl := strings.TrimRight(d.ChainConfig.Lcd, "/")
+    if lcdUrl == "" {
+        return fmt.Errorf("no LCD endpoint configured for %s", d.ChainConfig.name)
+    }
+    req, err := http.NewRequestWithContext(ctx, "GET", lcdUrl+path, nil)
+    if err != nil {
+        return err
+    }
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    return json.NewDecoder(resp.Body).Decode(result)
 }
 
 // txSearchFirstHash queries tx_search on nodeURL and returns the hash of the first result,
@@ -350,24 +369,48 @@ func (d *DefaultProvider) QueryValidatorInfo(ctx context.Context) (pub []byte, m
 	return pubBytes, val.Validator.GetMoniker(), val.Validator.Jailed, val.Validator.Status == 3, val.Validator.Tokens.ToDec().MustFloat64(), val.Validator.Commission.Rate.MustFloat64(), nil
 }
 
-func (d *DefaultProvider) QuerySigningInfo(ctx context.Context) (*slashing.ValidatorSigningInfo, error) {
-	// get current signing information (tombstoned, missed block count)
-	qSigning := slashing.QuerySigningInfoRequest{ConsAddress: d.ChainConfig.valInfo.Valcons}
-	b, err := qSigning.Marshal()
-	if err != nil {
-		return nil, fmt.Errorf("marshal signing info request: %w", err)
-	}
-	resp, err := d.ChainConfig.client.ABCIQuery(ctx, "/cosmos.slashing.v1beta1.Query/SigningInfo", b)
-	if resp == nil || resp.Response.Value == nil {
-		return nil, fmt.Errorf("query signing info: %w", err)
-	}
-	info := &slashing.QuerySigningInfoResponse{}
-	err = info.Unmarshal(resp.Response.Value)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal signing info response: %w", err)
-	}
+func isHTMLResponse(data []byte) bool {
+    return len(data) > 0 && data[0] == '<'
+}
 
-	return &info.ValSigningInfo, nil
+func (d *DefaultProvider) QuerySigningInfo(ctx context.Context) (*slashing.ValidatorSigningInfo, error) {
+    qSigning := slashing.QuerySigningInfoRequest{ConsAddress: d.ChainConfig.valInfo.Valcons}
+    b, err := qSigning.Marshal()
+    if err != nil {
+        return nil, fmt.Errorf("marshal signing info request: %w", err)
+    }
+    resp, err := d.ChainConfig.client.ABCIQuery(ctx, "/cosmos.slashing.v1beta1.Query/SigningInfo", b)
+    // LCD fallback if ABCI fails or returns HTML
+    if err != nil || resp == nil || resp.Response.Value == nil || isHTMLResponse(resp.Response.Value) {
+        if d.ChainConfig.Lcd != "" {
+            var lcdResp struct {
+                ValSigningInfo struct {
+                    Address             string `json:"address"`
+                    StartHeight         string `json:"start_height"`
+                    IndexOffset         string `json:"index_offset"`
+                    JailedUntil         string `json:"jailed_until"`
+                    Tombstoned          bool   `json:"tombstoned"`
+                    MissedBlocksCounter string `json:"missed_blocks_counter"`
+                } `json:"val_signing_info"`
+            }
+            if lcdErr := d.lcdGet(ctx, "/cosmos/slashing/v1beta1/signing_infos/"+d.ChainConfig.valInfo.Valcons, &lcdResp); lcdErr == nil {
+                missed, _ := strconv.ParseInt(lcdResp.ValSigningInfo.MissedBlocksCounter, 10, 64)
+                jailedUntil, _ := time.Parse(time.RFC3339Nano, lcdResp.ValSigningInfo.JailedUntil)
+                return &slashing.ValidatorSigningInfo{
+                    Address:             lcdResp.ValSigningInfo.Address,
+                    MissedBlocksCounter: missed,
+                    Tombstoned:          lcdResp.ValSigningInfo.Tombstoned,
+                    JailedUntil:         jailedUntil,
+                }, nil
+            }
+        }
+        return nil, fmt.Errorf("query signing info: %w", err)
+    }
+    info := &slashing.QuerySigningInfoResponse{}
+    if err = info.Unmarshal(resp.Response.Value); err != nil {
+        return nil, fmt.Errorf("unmarshal signing info response: %w", err)
+    }
+    return &info.ValSigningInfo, nil
 }
 
 func (d *DefaultProvider) QuerySlashingParams(ctx context.Context) (*slashing.Params, error) {

@@ -250,6 +250,8 @@ type ChainConfig struct {
 	// If not set, defaults to lowercase of the chain's display name.
 	// Used to fetch chain params from cosmos.directory and as RPC fallback.
 	ChainName string `yaml:"chain_name"`
+	// REST/LCD endpoint URL for fallback queries
+	Lcd string `yaml:"lcd"` 
 }
 
 // mkUpdate returns the info needed by prometheus for a gauge.
